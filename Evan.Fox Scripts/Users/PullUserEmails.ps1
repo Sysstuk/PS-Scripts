@@ -1,0 +1,1 @@
+Get-ADUser -filter * -properties userprincipalname,description -searchbase "OU=Partners,OU=Users,OU=SEQ,DC=springeq,DC=local" | select-object {$_.userprincipalname,$_.description} | out-file -FilePath "C:\Users\evan.fox\OneDrive - Spring EQ\Desktop\Contractors.txt"

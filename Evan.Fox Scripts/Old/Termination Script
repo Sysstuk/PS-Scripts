@@ -1,0 +1,142 @@
+#Disables user, resets password, removes groups, removes organization info, and moves to disabled OU
+function adterm {
+    #Checks to see if user exists or is already disabled
+    Do {
+        $empName = Read-Host "Enter Terminated Employee's Username"
+        $termEmp = Get-ADUser -Filter 'SAMAccountName -eq $empName'
+        if ($termEmp -eq $null) {
+            $empName = $null
+            Write-Warning "User object does not exist. Please try again"
+        } elseif ((Get-ADUser $termEmp).Enabled -eq $False) {
+            $empName = $null
+            $termEmp = $null
+            Write-Warning "User object is already disabled"
+        }
+    }
+    Until ($termEmp -ne $null)
+
+    #sets username entry to all lower case and resets password/disables account
+    $termEmp = ($termEmp).toLower()
+    $NewPassword = (Read-Host -Prompt "Provide New Password" -AsSecureString)
+    Set-ADAccountPassword -Identity $termEmp -NewPassword $NewPassword -Reset
+    Disable-AdAccount -Identity $termEmp
+    Write-Host "Password reset and account disabled"
+    
+    #Retrieves the assigned manager of the user before info gets wiped. Will be used for Exchange delegations
+    $mgr = (Get-ADUser ((Get-ADUser $termEmp -Properties Manager).Manager) -properties displayname).displayname
+    
+    #Removes all groups from AD profile (Member Of tab)
+    $groups = Get-ADPrincipalGroupMembership -identity $termEmp
+    $groups
+    foreach ($group in $groups) {
+        if (($group).name -ne "Domain Users") {
+            Write-Host $group
+            Remove-AdGroupMember -Identity $group -Members $termEmp
+        }
+    }
+    
+    #Get description from user and sets it. Removes Organizational info
+    $description = Read-Host -Prompt "Enter new description"
+    Set-AdUser $termEmp -Title $null -Department $null -Company $null -Description $description -Clear Manager
+
+    #Moves user to disabled OU
+    $termEmp = Get-ADUser ctd1
+    Move-ADObject -Identity $termEmp -TargetPath "OU=Disabled Users,OU=SEQ,DC=springeq,DC=local"
+}
+
+#Runs the AD/AAD sync on DC-03. If it fails, it will try it again
+function dcsync {
+    try{
+        Invoke-Command -ComputerName 'springeq-dc03' -ScriptBlock {Start-AdSyncSyncCycle -Policytype Delta} -Credential $creds
+        Write-Host "Please wait 75 seconds for sync" -ForegroundColor Yellow
+        Start-Sleep -Seconds 75
+    } catch {
+        Write-Host "Sync failed. Trying again..."
+        dcsync
+    }
+}
+
+#Connects to AAD and removes licenses, sessions, groups, converts the mailbox, and delegates/sets OOO for it
+function aadterm {
+    try{
+        Get-AzureADCurrentSessionInfo -ErrorAction Stop > $null
+    } catch {
+        Connect-AzureAD -Credential $msCreds
+        aadterm
+    }
+    Connect-AzureAd
+    Get-AzureAdUser | Get-Member
+    $objId = (Get-AzureAdUser -ObjectId "$termEmp").ObjectID
+    $upn = (Get-AzureAdUser -ObjectId "$termEmp").UserPrincipalName
+
+    #Revokes user sessions
+    Revoke-AzureADUserAllRefreshToken -ObjectId $objId
+
+    #Pulls role and group memberships, logs them, then removes the user from them
+    $roleGroups = (Get-AzureADUserMembership -ObjectId $objId).ObjectID
+    #If statement makes sure it's not removing them from All Users since it will throw a permission error for most of us
+    foreach($item in $roleGroups) {
+        if ($item -ne "7b181853-5483-44f0-ab96-fc73261a73cc") {
+            Remove-AzureADGroupMember -ObjectID $item -MemberID $objId
+        }
+    }
+    
+    #Checks for an active Exchange Online connection
+    $getsessions = Get-PSSession | Select-Object -Property State, Name
+    $isconnected = (@($getsessions) -like '@{State=Opened; Name=ExchangeOnlineInternalSession*').Count -gt 0
+    if ($isconnected -ne "True") {
+        Connect-ExchangeOnline
+    }
+
+    #Sets mailbox to shared, adds manager delegate, and asks for/sets OOO message    
+    Get-Mailbox -Identity $upn | Set-Mailbox -Type Shared
+    Add-MailboxPermission ctd1 -User evan.fox -AccessRights FullAccess -InheritanceType All
+    $ooo = Read-Host -Prompt "Please copy and paste OOO message from ticket"
+    Set-MailboxAutoReplyConfiguration -Identity $upn -AutoReplyState Enabled -ExternalAudience All -ExternalMessage $ooo -InternalMessage $ooo
+
+    #Removes all licenses for user
+    $userList = Get-AzureADUser -ObjectID $upn
+    $Skus = $userList | Select -ExpandProperty AssignedLicenses | Select SkuID
+    if($userList.Count -ne 0) {
+        if($Skus -is [array])
+        {
+            $licenses = New-Object -TypeName Microsoft.Open.AzureAD.Model.AssignedLicenses
+            for ($i=0; $i -lt $Skus.Count; $i++) {
+                $licenses.RemoveLicenses +=  (Get-AzureADSubscribedSku | Where-Object -Property SkuID -Value $Skus[$i].SkuId -EQ).SkuID   
+            }
+            Set-AzureADUserLicense -ObjectId $userUPN -AssignedLicenses $licenses
+        } else {
+            $licenses = New-Object -TypeName Microsoft.Open.AzureAD.Model.AssignedLicenses
+            $licenses.RemoveLicenses =  (Get-AzureADSubscribedSku | Where-Object -Property SkuID -Value $Skus.SkuId -EQ).SkuID
+            Set-AzureADUserLicense -ObjectId $userUPN -AssignedLicenses $licenses
+        }
+    }
+
+}
+
+#Sets up the variables used in the choice prompt in the Do loop
+function setOptions {
+    $caption = "Continue?"
+    $message = "Employee terminated. Would you like to repeat the process?"
+    $yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes"
+    $no = New-Object System.Management.Automation.Host.ChoiceDescription "&No"
+    $options = [System.Management.Automation.Host.ChoiceDescription[]]($yes,$no)
+}
+
+
+#$creds = Get-Credential
+$msCreds = Get-Credential
+import-module azureadpreview
+
+#Initiates set up of variables for the do-while statement
+setOptions
+
+Do{
+    adterm
+    dcsync
+    aadterm
+    
+    $continue = $host.ui.promptforchoice($caption,$message,$options,1) #Defaults to No (1)
+} While ($continue -eq 0)
+
+
